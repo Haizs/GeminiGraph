@@ -25,14 +25,14 @@ Copyright (c) 2015-2016 Xiaowei Zhu, Tsinghua University
 #include <sys/types.h>
 
 inline bool file_exists(std::string filename) {
-  struct stat st;
-  return stat(filename.c_str(), &st)==0;
+    struct stat st;
+    return stat(filename.c_str(), &st) == 0;
 }
 
 inline long file_size(std::string filename) {
-  struct stat st;
-  assert(stat(filename.c_str(), &st)==0);
-  return st.st_size;
+    struct stat st;
+    assert(stat(filename.c_str(), &st) == 0);
+    return st.st_size;
 }
 
 #endif

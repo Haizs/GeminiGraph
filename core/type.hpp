@@ -19,52 +19,52 @@ Copyright (c) 2015-2016 Xiaowei Zhu, Tsinghua University
 
 #include <stdint.h>
 
-struct Empty { };
+struct Empty {};
 
 typedef uint32_t VertexId;
 typedef uint64_t EdgeId;
 
-template <typename EdgeData>
+template<typename EdgeData>
 struct EdgeUnit {
-  VertexId src;
-  VertexId dst;
-  EdgeData edge_data;
-} __attribute__((packed));
-
-template <>
-struct EdgeUnit <Empty> {
-  VertexId src;
-  union {
+    VertexId src;
     VertexId dst;
-    Empty edge_data;
-  };
+    EdgeData edge_data;
 } __attribute__((packed));
 
-template <typename EdgeData>
+template<>
+struct EdgeUnit<Empty> {
+    VertexId src;
+    union {
+        VertexId dst;
+        Empty edge_data;
+    };
+} __attribute__((packed));
+
+template<typename EdgeData>
 struct AdjUnit {
-  VertexId neighbour;
-  EdgeData edge_data;
+    VertexId neighbour;
+    EdgeData edge_data;
 } __attribute__((packed));
 
-template <>
-struct AdjUnit <Empty> {
-  union {
-    VertexId neighbour;
-    Empty edge_data;
-  };
+template<>
+struct AdjUnit<Empty> {
+    union {
+        VertexId neighbour;
+        Empty edge_data;
+    };
 } __attribute__((packed));
 
 struct CompressedAdjIndexUnit {
-  EdgeId index;
-  VertexId vertex;
+    EdgeId index;
+    VertexId vertex;
 } __attribute__((packed));
 
-template <typename EdgeData>
+template<typename EdgeData>
 struct VertexAdjList {
-  AdjUnit<EdgeData> * begin;
-  AdjUnit<EdgeData> * end;
-  VertexAdjList() : begin(nullptr), end(nullptr) { }
-  VertexAdjList(AdjUnit<EdgeData> * begin, AdjUnit<EdgeData> * end) : begin(begin), end(end) { }
+    AdjUnit<EdgeData> *begin;
+    AdjUnit<EdgeData> *end;
+    VertexAdjList() : begin(nullptr), end(nullptr) {}
+    VertexAdjList(AdjUnit<EdgeData> *begin, AdjUnit<EdgeData> *end) : begin(begin), end(end) {}
 };
 
 #endif

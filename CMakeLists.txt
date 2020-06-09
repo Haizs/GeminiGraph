@@ -12,6 +12,8 @@ set(CMAKE_CXX_COMPILE_FLAGS ${CMAKE_CXX_COMPILE_FLAGS} ${MPI_COMPILE_FLAGS})
 set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} ${MPI_LINK_FLAGS}")
 link_libraries(numa)
 
+add_definitions(-DPRINT_DEBUG_MESSAGES)
+
 add_executable(bc
         toolkits/bc.cpp)
 

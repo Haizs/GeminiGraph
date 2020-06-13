@@ -1,3 +1,5 @@
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "openmp-use-default-none"
 /*
 Copyright (c) 2015-2016 Xiaowei Zhu, Tsinghua University
 
@@ -91,52 +93,56 @@ struct MsgUnit {
 template<typename EdgeData = Empty>
 class Graph {
  public:
-  int partition_id;
-  int partitions;
+  int partition_id; // 节点编号，MPI_Comm_rank
+  int partitions; // 节点总数，MPI_Comm_size
 
-  size_t alpha;
+  size_t alpha; // = 8 * (partitions - 1), 分区用权重
 
-  int threads;
-  int sockets;
+  int threads; // the number of cpus in the system, 逻辑核数
+  int sockets; // the number of memory nodes in the system, 机器上的CPU插槽
   int threads_per_socket;
 
   size_t edge_data_size;
-  size_t unit_size;
-  size_t edge_unit_size;
+  size_t unit_size; // = sizeof(VertexId) + edge_data_size
+  size_t edge_unit_size; // = sizeof(VertexId) + edge_data_size + sizeof(VertexId)
 
-  bool symmetric;
-  VertexId vertices;
-  EdgeId edges;
+  bool symmetric; // 对称，false有向图，true无向图
+  VertexId vertices; // 原图总点数
+  EdgeId edges; // 原图总边数
   VertexId *out_degree; // VertexId [vertices]; numa-aware
   VertexId *in_degree; // VertexId [vertices]; numa-aware
 
-  VertexId *partition_offset; // VertexId [partitions+1]
-  VertexId *local_partition_offset; // VertexId [sockets+1]
+  VertexId *partition_offset; // VertexId [partitions+1], 节点上顶点的范围 [[p], [p+1])
+  VertexId *local_partition_offset; // VertexId [sockets+1], socket上顶点的范围 [[s], [s+1])
 
-  VertexId owned_vertices;
-  EdgeId *outgoing_edges; // EdgeId [sockets]
-  EdgeId *incoming_edges; // EdgeId [sockets]
+  VertexId owned_vertices; // 当前节点拥有的主副本个数
+  EdgeId *outgoing_edges; // EdgeId [sockets], 某个socket的出边总数
+  EdgeId *incoming_edges; // EdgeId [sockets], 某个socket的入边总数
 
-  Bitmap **incoming_adj_bitmap;
-  EdgeId **incoming_adj_index; // EdgeId [sockets] [vertices+1]; numa-aware
-  AdjUnit<EdgeData> **incoming_adj_list; // AdjUnit<EdgeData> [sockets] [vertices+1]; numa-aware
-  Bitmap **outgoing_adj_bitmap;
-  EdgeId **outgoing_adj_index; // EdgeId [sockets] [vertices+1]; numa-aware
-  AdjUnit<EdgeData> **outgoing_adj_list; // AdjUnit<EdgeData> [sockets] [vertices+1]; numa-aware
+  Bitmap **incoming_adj_bitmap; // (BitMap*)[sockets]，每个顶点是否在socket分区上含有入边
+  EdgeId **incoming_adj_index; // EdgeId [sockets] [vertices+1]; numa-aware, socket中每个顶点的入边在list中的起始偏移量
+  AdjUnit<EdgeData> **incoming_adj_list; // AdjUnit<EdgeData> [sockets] [vertices+1]; numa-aware, socket中的入边列表
+  Bitmap **outgoing_adj_bitmap; // (BitMap*)[sockets]，每个顶点是否在socket分区上含有出边
+  EdgeId **outgoing_adj_index; // EdgeId [sockets] [vertices+1]; numa-aware, socket中每个顶点的出边在list中的起始偏移量
+  AdjUnit<EdgeData> **outgoing_adj_list; // AdjUnit<EdgeData> [sockets] [vertices+1]; numa-aware, socket中的出边列表
 
-  VertexId *compressed_incoming_adj_vertices;
-  CompressedAdjIndexUnit **compressed_incoming_adj_index; // CompressedAdjIndexUnit [sockets] [...+1]; numa-aware
-  VertexId *compressed_outgoing_adj_vertices;
-  CompressedAdjIndexUnit **compressed_outgoing_adj_index; // CompressedAdjIndexUnit [sockets] [...+1]; numa-aware
+  VertexId *compressed_incoming_adj_vertices; // [sockets], 每个socket上有入边的顶点的数量
+  // CompressedAdjIndexUnit [sockets] [...+1]; numa-aware
+  // 在socket上有入边的顶点和其入边在incoming_adj_list的起始偏移量，按照顶点id顺序存储
+  CompressedAdjIndexUnit **compressed_incoming_adj_index;
+  VertexId *compressed_outgoing_adj_vertices; // [sockets], 每个socket上有出边的顶点的数量
+  // CompressedAdjIndexUnit [sockets] [...+1]; numa-aware
+  // 在socket上有出边的顶点和其出边在outgoing_adj_list的起始偏移量，按照顶点id顺序存储
+  CompressedAdjIndexUnit **compressed_outgoing_adj_index;
 
-  ThreadState **thread_state; // ThreadState* [threads]; numa-aware
-  ThreadState **tuned_chunks_dense; // ThreadState [partitions][threads];
+  ThreadState **thread_state; // ThreadState* [threads]; numa-aware, 线程工作范围和状态
+  ThreadState **tuned_chunks_dense; // ThreadState [partitions][threads]; dense模式下发给不同的节点消息时，线程处理的顶点范围
   ThreadState **tuned_chunks_sparse; // ThreadState [partitions][threads];
 
   size_t local_send_buffer_limit;
-  MessageBuffer **local_send_buffer; // MessageBuffer* [threads]; numa-aware
+  MessageBuffer **local_send_buffer; // MessageBuffer* [threads]; numa-aware, 每个线程的发送buffer
 
-  int current_send_part_id;
+  int current_send_part_id; // 稀疏推送时为本地节点id，稠密拉取时为发送给节点id。用于区分send_buffer
   MessageBuffer ***send_buffer; // MessageBuffer* [partitions] [sockets]; numa-aware
   MessageBuffer ***recv_buffer; // MessageBuffer* [partitions] [sockets]; numa-aware
 
@@ -148,10 +154,16 @@ class Graph {
     init();
   }
 
+  /// 返回thread所在socket的id
+  /// \param thread_id
+  /// \return thread_id / threads_per_socket
   inline int get_socket_id(int thread_id) {
     return thread_id / threads_per_socket;
   }
 
+  /// 返回thread在socket中的offset
+  /// \param thread_id
+  /// \return thread_id % threads_per_socket
   inline int get_socket_offset(int thread_id) {
     return thread_id % threads_per_socket;
   }
@@ -168,39 +180,41 @@ class Graph {
     nodestring[0] = '0';
     for (int s_i = 1; s_i < sockets; s_i++) {
       nodestring[s_i * 2 - 1] = ',';
-      nodestring[s_i * 2] = '0' + s_i;
+      nodestring[s_i * 2] = '0' + s_i; // 只支持0-9？
     }
+    nodestring[sockets * 2 - 1] = '\0'; // fix: string end 0
     struct bitmask *nodemask = numa_parse_nodestring(nodestring);
-    numa_set_interleave_mask(nodemask);
+    numa_set_interleave_mask(nodemask); // Enable interleaving for the current thread.
+    // All future memory allocations allocate memory round robin interleaved over the nodemask specified.
 
     omp_set_dynamic(0);
     omp_set_num_threads(threads);
     thread_state = new ThreadState *[threads];
     local_send_buffer_limit = 16;
     local_send_buffer = new MessageBuffer *[threads];
-    for (int t_i = 0; t_i < threads; t_i++) {
+    for (int t_i = 0; t_i < threads; t_i++) { // 在对应socket上申请空间
       thread_state[t_i] = (ThreadState *) numa_alloc_onnode(sizeof(ThreadState), get_socket_id(t_i));
       local_send_buffer[t_i] = (MessageBuffer *) numa_alloc_onnode(sizeof(MessageBuffer), get_socket_id(t_i));
       local_send_buffer[t_i]->init(get_socket_id(t_i));
     }
 #pragma omp parallel for
-    for (int t_i = 0; t_i < threads; t_i++) {
+    for (int t_i = 0; t_i < threads; t_i++) { // 线程绑定socket
       int s_i = get_socket_id(t_i);
       assert(numa_run_on_node(s_i) == 0);
 #ifdef PRINT_DEBUG_MESSAGES
-      // printf("thread-%d bound to socket-%d\n", t_i, s_i);
+      printf("thread-%d bound to socket-%d\n", t_i, s_i);
 #endif
     }
 #ifdef PRINT_DEBUG_MESSAGES
-    // printf("threads=%d*%d\n", sockets, threads_per_socket);
-    // printf("interleave on %s\n", nodestring);
+    printf("threads=%d*%d\n", sockets, threads_per_socket);
+    printf("interleave on %s\n", nodestring);
 #endif
 
     MPI_Comm_rank(MPI_COMM_WORLD, &partition_id);
     MPI_Comm_size(MPI_COMM_WORLD, &partitions);
     send_buffer = new MessageBuffer **[partitions];
     recv_buffer = new MessageBuffer **[partitions];
-    for (int i = 0; i < partitions; i++) {
+    for (int i = 0; i < partitions; i++) { // 每个partition对于每个socket都有发送/接受的buffer
       send_buffer[i] = new MessageBuffer *[sockets];
       recv_buffer[i] = new MessageBuffer *[sockets];
       for (int s_i = 0; s_i < sockets; s_i++) {
@@ -342,6 +356,9 @@ class Graph {
     return new VertexSubset(vertices);
   }
 
+  /// 计算顶点所在节点编号
+  /// \param v_i
+  /// \return partition id
   int get_partition_id(VertexId v_i) {
     for (int i = 0; i < partitions; i++) {
       if (v_i >= partition_offset[i] && v_i < partition_offset[i + 1]) {
@@ -351,6 +368,9 @@ class Graph {
     assert(false);
   }
 
+  /// 计算顶点所在socket编号
+  /// \param v_i
+  /// \return socket id
   int get_local_partition_id(VertexId v_i) {
     for (int s_i = 0; s_i < sockets; s_i++) {
       if (v_i >= local_partition_offset[s_i] && v_i < local_partition_offset[s_i + 1]) {
@@ -373,13 +393,13 @@ class Graph {
     long total_bytes = file_size(path.c_str());
     this->edges = total_bytes / edge_unit_size;
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
+    if (partition_id == 0) {
       printf("|V| = %u, |E| = %lu\n", vertices, edges);
     }
 #endif
 
     EdgeId read_edges = edges / partitions;
-    if (partition_id == partitions - 1) {
+    if (partition_id == partitions - 1) { // 最后一个节点读完所有边
       read_edges += edges % partitions;
     }
     long bytes_to_read = edge_unit_size * read_edges;
@@ -409,38 +429,38 @@ class Graph {
         VertexId src = read_edge_buffer[e_i].src;
         VertexId dst = read_edge_buffer[e_i].dst;
         __sync_fetch_and_add(&out_degree[src], 1);
-        __sync_fetch_and_add(&out_degree[dst], 1);
+        __sync_fetch_and_add(&out_degree[dst], 1); // 视为双向边
       }
     }
-    MPI_Allreduce(MPI_IN_PLACE, out_degree, vertices, vid_t, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, out_degree, vertices, vid_t, MPI_SUM, MPI_COMM_WORLD); // 所有节点out_degree求和
 
-    // locality-aware chunking
+    // locality-aware chunking, 节点间的子图划分
     partition_offset = new VertexId[partitions + 1];
     partition_offset[0] = 0;
-    EdgeId remained_amount = edges * 2 + EdgeId(vertices) * alpha;
+    EdgeId remained_amount = edges * 2 + EdgeId(vertices) * alpha; // 子图分割指标，划分使得该值尽可能一致，无向图两倍边
     for (int i = 0; i < partitions; i++) {
       VertexId remained_partitions = partitions - i;
-      EdgeId expected_chunk_size = remained_amount / remained_partitions;
-      if (remained_partitions == 1) {
+      EdgeId expected_chunk_size = remained_amount / remained_partitions; // 期望剩余节点的分割指标尽可能一致
+      if (remained_partitions == 1) { // 最后一个节点的右边界为顶点总数
         partition_offset[i + 1] = vertices;
       } else {
         EdgeId got_edges = 0;
-        for (VertexId v_i = partition_offset[i]; v_i < vertices; v_i++) {
+        for (VertexId v_i = partition_offset[i]; v_i < vertices; v_i++) { // 从当前节点分区的起始顶点遍历
           got_edges += out_degree[v_i] + alpha;
-          if (got_edges > expected_chunk_size) {
-            partition_offset[i + 1] = v_i;
+          if (got_edges > expected_chunk_size) { // 找到连续的顶点使得最接近但不超过分割指标
+            partition_offset[i + 1] = v_i; // 下一个节点分区的左边界
             break;
           }
         }
-        partition_offset[i + 1] = (partition_offset[i + 1]) / PAGESIZE * PAGESIZE; // aligned with pages
+        partition_offset[i + 1] = (partition_offset[i + 1]) / PAGESIZE * PAGESIZE; // aligned with pages, 边界4K对齐
       }
-      for (VertexId v_i = partition_offset[i]; v_i < partition_offset[i + 1]; v_i++) {
+      for (VertexId v_i = partition_offset[i]; v_i < partition_offset[i + 1]; v_i++) { // 计算剩余的分割指标
         remained_amount -= out_degree[v_i] + alpha;
       }
     }
     assert(partition_offset[partitions] == vertices);
     owned_vertices = partition_offset[partition_id + 1] - partition_offset[partition_id];
-    // check consistency of partition boundaries
+    // check consistency of partition boundaries, 确认每个节点计算的分区偏移一致
     VertexId *global_partition_offset = new VertexId[partitions + 1];
     MPI_Allreduce(partition_offset, global_partition_offset, partitions + 1, vid_t, MPI_MAX, MPI_COMM_WORLD);
     for (int i = 0; i <= partitions; i++) {
@@ -451,23 +471,24 @@ class Graph {
       assert(partition_offset[i] == global_partition_offset[i]);
     }
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
-      for (int i=0;i<partitions;i++) {
+    if (partition_id == 0) {
+      for (int i = 0; i < partitions; i++) {
         EdgeId part_out_edges = 0;
-        for (VertexId v_i=partition_offset[i];v_i<partition_offset[i+1];v_i++) {
+        for (VertexId v_i = partition_offset[i]; v_i < partition_offset[i + 1]; v_i++) {
           part_out_edges += out_degree[v_i];
         }
-        printf("|V'_%d| = %u |E_%d| = %lu\n", i, partition_offset[i+1] - partition_offset[i], i, part_out_edges);
+        printf("|V'_%d| = %u |E_%d| = %lu\n", i, partition_offset[i + 1] - partition_offset[i], i, part_out_edges);
       }
     }
     MPI_Barrier(MPI_COMM_WORLD);
 #endif
     delete[] global_partition_offset;
     {
-      // NUMA-aware sub-chunking
+      // NUMA-aware sub-chunking, 节点内socket间的子图划分，同上
       local_partition_offset = new VertexId[sockets + 1];
       EdgeId part_out_edges = 0;
-      for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1]; v_i++) {
+      for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1];
+           v_i++) { // 计算当前节点总边数
         part_out_edges += out_degree[v_i];
       }
       local_partition_offset[0] = partition_offset[partition_id];
@@ -495,11 +516,17 @@ class Graph {
           sub_part_out_edges += out_degree[v_i];
         }
 #ifdef PRINT_DEBUG_MESSAGES
-        printf("|V'_%d_%d| = %u |E_%d| = %lu\n", partition_id, s_i, local_partition_offset[s_i+1] - local_partition_offset[s_i], partition_id, sub_part_out_edges);
+        printf("|V'_%d_%d| = %u |E_%d| = %lu\n",
+               partition_id,
+               s_i,
+               local_partition_offset[s_i + 1] - local_partition_offset[s_i],
+               partition_id,
+               sub_part_out_edges);
 #endif
       }
     }
 
+    // numa-aware, 属于当前节点的顶点的out_degree存至对应socket的内存中
     VertexId *filtered_out_degree = alloc_vertex_array<VertexId>();
     for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1]; v_i++) {
       filtered_out_degree[v_i] = out_degree[v_i];
@@ -508,6 +535,7 @@ class Graph {
     out_degree = filtered_out_degree;
     in_degree = out_degree;
 
+    // 边数据的发送/接收buffer
     int *buffered_edges = new int[partitions];
     std::vector<char> *send_buffer = new std::vector<char>[partitions];
     for (int i = 0; i < partitions; i++) {
@@ -530,13 +558,13 @@ class Graph {
       std::thread recv_thread_dst([&]() {
         int finished_count = 0;
         MPI_Status recv_status;
-        while (finished_count < partitions) {
+        while (finished_count < partitions) { // 接收所有节点的消息
           MPI_Probe(MPI_ANY_SOURCE, ShuffleGraph, MPI_COMM_WORLD, &recv_status);
           int i = recv_status.MPI_SOURCE;
           assert(recv_status.MPI_TAG == ShuffleGraph && i >= 0 && i < partitions);
           int recv_bytes;
           MPI_Get_count(&recv_status, MPI_CHAR, &recv_bytes);
-          if (recv_bytes == 1) {
+          if (recv_bytes == 1) { // 收到结束信号
             finished_count += 1;
             char c;
             MPI_Recv(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -555,15 +583,15 @@ class Graph {
           for (EdgeId e_i = 0; e_i < recv_edges; e_i++) {
             VertexId src = recv_buffer[e_i].src;
             VertexId dst = recv_buffer[e_i].dst;
-            assert(dst >= partition_offset[partition_id] && dst < partition_offset[partition_id + 1]);
+            assert(dst >= partition_offset[partition_id] && dst < partition_offset[partition_id + 1]); // dst属于当前节点
             int dst_part = get_local_partition_id(dst);
-            if (!outgoing_adj_bitmap[dst_part]->get_bit(src)) {
+            if (!outgoing_adj_bitmap[dst_part]->get_bit(src)) { // src是一个在dst_part分区上含有出边的顶点
               outgoing_adj_bitmap[dst_part]->set_bit(src);
               outgoing_adj_index[dst_part][src] = 0;
             }
-            __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1);
+            __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1); // src的出边数量加一
           }
-          recv_outgoing_edges += recv_edges;
+          recv_outgoing_edges += recv_edges; // 累加收到的边的数量
         }
       });
       for (int i = 0; i < partitions; i++) {
@@ -571,7 +599,7 @@ class Graph {
       }
       assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
       read_bytes = 0;
-      while (read_bytes < bytes_to_read) {
+      while (read_bytes < bytes_to_read) { // 从节点对应的文件偏移处开始读数据
         long curr_read_bytes;
         if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
           curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
@@ -584,11 +612,11 @@ class Graph {
         for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) {
           VertexId dst = read_edge_buffer[e_i].dst;
           int i = get_partition_id(dst);
-          memcpy(send_buffer[i].data() + edge_unit_size * buffered_edges[i],
-                 &read_edge_buffer[e_i],
+          memcpy(send_buffer[i].data() + edge_unit_size * buffered_edges[i], // 存至vector内存的偏移位置
+                 &read_edge_buffer[e_i], // 读的边的数据
                  edge_unit_size);
           buffered_edges[i] += 1;
-          if (buffered_edges[i] == CHUNKSIZE) {
+          if (buffered_edges[i] == CHUNKSIZE) { // 每读一个CHUNKSIZE的数量的边就发送
             MPI_Send(send_buffer[i].data(),
                      edge_unit_size * buffered_edges[i],
                      MPI_CHAR,
@@ -598,13 +626,13 @@ class Graph {
             buffered_edges[i] = 0;
           }
         }
-        for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) {
+        for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) { // 交换边的起始点
           // std::swap(read_edge_buffer[e_i].src, read_edge_buffer[e_i].dst);
           VertexId tmp = read_edge_buffer[e_i].src;
           read_edge_buffer[e_i].src = read_edge_buffer[e_i].dst;
           read_edge_buffer[e_i].dst = tmp;
         }
-        for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) {
+        for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) { // 发送反向边的数据
           VertexId dst = read_edge_buffer[e_i].dst;
           int i = get_partition_id(dst);
           memcpy(send_buffer[i].data() + edge_unit_size * buffered_edges[i],
@@ -622,7 +650,7 @@ class Graph {
           }
         }
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送剩余的边数据
         if (buffered_edges[i] == 0) continue;
         MPI_Send(send_buffer[i].data(),
                  edge_unit_size * buffered_edges[i],
@@ -632,7 +660,7 @@ class Graph {
                  MPI_COMM_WORLD);
         buffered_edges[i] = 0;
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送结束信号
         char c = 0;
         MPI_Send(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD);
       }
@@ -641,14 +669,15 @@ class Graph {
       printf("machine(%d) got %lu symmetric edges\n", partition_id, recv_outgoing_edges);
 #endif
     }
+
     compressed_outgoing_adj_vertices = new VertexId[sockets];
     compressed_outgoing_adj_index = new CompressedAdjIndexUnit *[sockets];
     for (int s_i = 0; s_i < sockets; s_i++) {
-      outgoing_edges[s_i] = 0;
-      compressed_outgoing_adj_vertices[s_i] = 0;
+      outgoing_edges[s_i] = 0; // s_i的出边数
+      compressed_outgoing_adj_vertices[s_i] = 0; // s_i的有出边的顶点数
       for (VertexId v_i = 0; v_i < vertices; v_i++) {
-        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) {
-          outgoing_edges[s_i] += outgoing_adj_index[s_i][v_i];
+        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) { // v_i在s_i上有出边
+          outgoing_edges[s_i] += outgoing_adj_index[s_i][v_i]; // 此时outgoing_adj_index存的是v_i的出边数量
           compressed_outgoing_adj_vertices[s_i] += 1;
         }
       }
@@ -658,35 +687,35 @@ class Graph {
       EdgeId last_e_i = 0;
       compressed_outgoing_adj_vertices[s_i] = 0;
       for (VertexId v_i = 0; v_i < vertices; v_i++) {
-        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) {
-          outgoing_adj_index[s_i][v_i] = last_e_i + outgoing_adj_index[s_i][v_i];
+        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) { // v_i在s_i上有出边，计算出边数组中每个点的范围的偏移量
+          outgoing_adj_index[s_i][v_i] = last_e_i + outgoing_adj_index[s_i][v_i]; // 求s_i上有出边的顶点的出边数量的前缀和
           last_e_i = outgoing_adj_index[s_i][v_i];
-          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].vertex = v_i;
-          compressed_outgoing_adj_vertices[s_i] += 1;
-          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].index = last_e_i;
+          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].vertex = v_i; // v_i是有出边的顶点
+          compressed_outgoing_adj_vertices[s_i] += 1; // 有出边的顶点数量加一
+          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].index = last_e_i; // v_i的出边的结尾偏移量
         }
       }
       for (VertexId p_v_i = 0; p_v_i < compressed_outgoing_adj_vertices[s_i]; p_v_i++) {
-        VertexId v_i = compressed_outgoing_adj_index[s_i][p_v_i].vertex;
-        outgoing_adj_index[s_i][v_i] = compressed_outgoing_adj_index[s_i][p_v_i].index;
-        outgoing_adj_index[s_i][v_i + 1] = compressed_outgoing_adj_index[s_i][p_v_i + 1].index;
+        VertexId v_i = compressed_outgoing_adj_index[s_i][p_v_i].vertex; // 每个在s_i上有出边的顶点v_i
+        outgoing_adj_index[s_i][v_i] = compressed_outgoing_adj_index[s_i][p_v_i].index; // 出边的起始偏移量
+        outgoing_adj_index[s_i][v_i + 1] = compressed_outgoing_adj_index[s_i][p_v_i + 1].index; // 出边的结尾偏移量
       }
 #ifdef PRINT_DEBUG_MESSAGES
-      printf("part(%d) E_%d has %lu symmetric edges\n", partition_id, s_i, outgoing_edges[s_i]);
+      printf("part(%d) E_%d has %lu symmetric edges\n", partition_id, s_i, outgoing_edges[s_i]); // 稀疏推送，有出边的顶点
 #endif
       outgoing_adj_list[s_i] = (AdjUnit<EdgeData> *) numa_alloc_onnode(unit_size * outgoing_edges[s_i], s_i);
     }
     {
-      std::thread recv_thread_dst([&]() {
+      std::thread recv_thread_dst([&]() { // 计算outgoing_adj_list
         int finished_count = 0;
         MPI_Status recv_status;
-        while (finished_count < partitions) {
+        while (finished_count < partitions) { // 接收所有节点的消息
           MPI_Probe(MPI_ANY_SOURCE, ShuffleGraph, MPI_COMM_WORLD, &recv_status);
           int i = recv_status.MPI_SOURCE;
           assert(recv_status.MPI_TAG == ShuffleGraph && i >= 0 && i < partitions);
           int recv_bytes;
           MPI_Get_count(&recv_status, MPI_CHAR, &recv_bytes);
-          if (recv_bytes == 1) {
+          if (recv_bytes == 1) { // 收到结束信号
             finished_count += 1;
             char c;
             MPI_Recv(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -707,10 +736,10 @@ class Graph {
             VertexId dst = recv_buffer[e_i].dst;
             assert(dst >= partition_offset[partition_id] && dst < partition_offset[partition_id + 1]);
             int dst_part = get_local_partition_id(dst);
-            EdgeId pos = __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1);
-            outgoing_adj_list[dst_part][pos].neighbour = dst;
+            EdgeId pos = __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1); // 占用一个位置
+            outgoing_adj_list[dst_part][pos].neighbour = dst; // 记录邻居为dst
             if (!std::is_same<EdgeData, Empty>::value) {
-              outgoing_adj_list[dst_part][pos].edge_data = recv_buffer[e_i].edge_data;
+              outgoing_adj_list[dst_part][pos].edge_data = recv_buffer[e_i].edge_data; // 记录边权
             }
           }
         }
@@ -720,7 +749,7 @@ class Graph {
       }
       assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
       read_bytes = 0;
-      while (read_bytes < bytes_to_read) {
+      while (read_bytes < bytes_to_read) { // 从节点对应的文件偏移位置开始读数据
         long curr_read_bytes;
         if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
           curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
@@ -741,13 +770,13 @@ class Graph {
             MPI_Send(send_buffer[i].data(),
                      edge_unit_size * buffered_edges[i],
                      MPI_CHAR,
-                     i,
+                     i, // 发给dst所属的节点
                      ShuffleGraph,
                      MPI_COMM_WORLD);
             buffered_edges[i] = 0;
           }
         }
-        for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) {
+        for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) { // 反向边
           // std::swap(read_edge_buffer[e_i].src, read_edge_buffer[e_i].dst);
           VertexId tmp = read_edge_buffer[e_i].src;
           read_edge_buffer[e_i].src = read_edge_buffer[e_i].dst;
@@ -771,7 +800,7 @@ class Graph {
           }
         }
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送剩余数据
         if (buffered_edges[i] == 0) continue;
         MPI_Send(send_buffer[i].data(),
                  edge_unit_size * buffered_edges[i],
@@ -781,13 +810,13 @@ class Graph {
                  MPI_COMM_WORLD);
         buffered_edges[i] = 0;
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送结束信号
         char c = 0;
         MPI_Send(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD);
       }
       recv_thread_dst.join();
     }
-    for (int s_i = 0; s_i < sockets; s_i++) {
+    for (int s_i = 0; s_i < sockets; s_i++) { // 恢复出边的范围的偏移量
       for (VertexId p_v_i = 0; p_v_i < compressed_outgoing_adj_vertices[s_i]; p_v_i++) {
         VertexId v_i = compressed_outgoing_adj_index[s_i][p_v_i].vertex;
         outgoing_adj_index[s_i][v_i] = compressed_outgoing_adj_index[s_i][p_v_i].index;
@@ -816,7 +845,7 @@ class Graph {
     prep_time += MPI_Wtime();
 
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
+    if (partition_id == 0) {
       printf("preprocessing cost: %.2lf (s)\n", prep_time);
     }
 #endif
@@ -847,13 +876,13 @@ class Graph {
     long total_bytes = file_size(path.c_str());
     this->edges = total_bytes / edge_unit_size;
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
+    if (partition_id == 0) {
       printf("|V| = %u, |E| = %lu\n", vertices, edges);
     }
 #endif
 
     EdgeId read_edges = edges / partitions;
-    if (partition_id == partitions - 1) {
+    if (partition_id == partitions - 1) { // 最后一个节点读完所有边
       read_edges += edges % partitions;
     }
     long bytes_to_read = edge_unit_size * read_edges;
@@ -863,14 +892,14 @@ class Graph {
     EdgeUnit<EdgeData> *read_edge_buffer = new EdgeUnit<EdgeData>[CHUNKSIZE];
 
     out_degree = alloc_interleaved_vertex_array<VertexId>();
-    for (VertexId v_i = 0; v_i < vertices; v_i++) {
+    for (VertexId v_i = 0; v_i < vertices; v_i++) { // 初始化一个记录所有顶点出度的数组
       out_degree[v_i] = 0;
     }
     assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
     read_bytes = 0;
     while (read_bytes < bytes_to_read) {
       long curr_read_bytes;
-      if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
+      if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) { // 每次最多读CHUNKSIZE数量的边
         curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
       } else {
         curr_read_bytes = read(fin, read_edge_buffer, bytes_to_read - read_bytes);
@@ -882,38 +911,38 @@ class Graph {
       for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) {
         VertexId src = read_edge_buffer[e_i].src;
         VertexId dst = read_edge_buffer[e_i].dst;
-        __sync_fetch_and_add(&out_degree[src], 1);
+        __sync_fetch_and_add(&out_degree[src], 1); // 有向边起点出度加一
       }
     }
-    MPI_Allreduce(MPI_IN_PLACE, out_degree, vertices, vid_t, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, out_degree, vertices, vid_t, MPI_SUM, MPI_COMM_WORLD); // 所有节点out_degree求和
 
-    // locality-aware chunking
+    // locality-aware chunking, 节点间的子图划分
     partition_offset = new VertexId[partitions + 1];
     partition_offset[0] = 0;
-    EdgeId remained_amount = edges + EdgeId(vertices) * alpha;
+    EdgeId remained_amount = edges + EdgeId(vertices) * alpha; // 子图分割指标，划分使得该值尽可能一致
     for (int i = 0; i < partitions; i++) {
       VertexId remained_partitions = partitions - i;
-      EdgeId expected_chunk_size = remained_amount / remained_partitions;
-      if (remained_partitions == 1) {
+      EdgeId expected_chunk_size = remained_amount / remained_partitions; // 期望剩余节点的分割指标尽可能一致
+      if (remained_partitions == 1) { // 最后一个节点的右边界为顶点总数
         partition_offset[i + 1] = vertices;
       } else {
         EdgeId got_edges = 0;
-        for (VertexId v_i = partition_offset[i]; v_i < vertices; v_i++) {
+        for (VertexId v_i = partition_offset[i]; v_i < vertices; v_i++) { // 从当前节点分区的起始顶点遍历
           got_edges += out_degree[v_i] + alpha;
-          if (got_edges > expected_chunk_size) {
-            partition_offset[i + 1] = v_i;
+          if (got_edges > expected_chunk_size) { // 找到连续的顶点使得最接近但不超过分割指标
+            partition_offset[i + 1] = v_i; // 下一个节点分区的左边界
             break;
           }
         }
-        partition_offset[i + 1] = (partition_offset[i + 1]) / PAGESIZE * PAGESIZE; // aligned with pages
+        partition_offset[i + 1] = (partition_offset[i + 1]) / PAGESIZE * PAGESIZE; // aligned with pages, 边界4K对齐
       }
-      for (VertexId v_i = partition_offset[i]; v_i < partition_offset[i + 1]; v_i++) {
+      for (VertexId v_i = partition_offset[i]; v_i < partition_offset[i + 1]; v_i++) { // 计算剩余的分割指标
         remained_amount -= out_degree[v_i] + alpha;
       }
     }
     assert(partition_offset[partitions] == vertices);
     owned_vertices = partition_offset[partition_id + 1] - partition_offset[partition_id];
-    // check consistency of partition boundaries
+    // check consistency of partition boundaries, 确认每个节点计算的分区偏移一致
     VertexId *global_partition_offset = new VertexId[partitions + 1];
     MPI_Allreduce(partition_offset, global_partition_offset, partitions + 1, vid_t, MPI_MAX, MPI_COMM_WORLD);
     for (int i = 0; i <= partitions; i++) {
@@ -924,66 +953,79 @@ class Graph {
       assert(partition_offset[i] == global_partition_offset[i]);
     }
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
-      for (int i=0;i<partitions;i++) {
+    if (partition_id == 0) {
+      for (int i = 0; i < partitions; i++) {
         EdgeId part_out_edges = 0;
-        for (VertexId v_i=partition_offset[i];v_i<partition_offset[i+1];v_i++) {
+        for (VertexId v_i = partition_offset[i]; v_i < partition_offset[i + 1]; v_i++) {
           part_out_edges += out_degree[v_i];
         }
-        printf("|V'_%d| = %u |E^dense_%d| = %lu\n", i, partition_offset[i+1] - partition_offset[i], i, part_out_edges);
+        printf("|V'_%d| = %u |E^dense_%d| = %lu\n",
+               i,
+               partition_offset[i + 1] - partition_offset[i],
+               i,
+               part_out_edges);
       }
     }
 #endif
     delete[] global_partition_offset;
     {
-      // NUMA-aware sub-chunking
+      // NUMA-aware sub-chunking, 节点内socket间的子图划分，同上
       local_partition_offset = new VertexId[sockets + 1];
       EdgeId part_out_edges = 0;
-      for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1]; v_i++) {
+      for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1];
+           v_i++) { // 计算当前节点总边数
         part_out_edges += out_degree[v_i];
       }
-      local_partition_offset[0] = partition_offset[partition_id];
-      EdgeId remained_amount = part_out_edges + EdgeId(owned_vertices) * alpha;
+      local_partition_offset[0] = partition_offset[partition_id]; // 第一个socket分区的起始位置是当前节点的起始位置
+      EdgeId remained_amount = part_out_edges + EdgeId(owned_vertices) * alpha; // 子图分割指标，划分使得该值尽可能一致
       for (int s_i = 0; s_i < sockets; s_i++) {
         VertexId remained_partitions = sockets - s_i;
-        EdgeId expected_chunk_size = remained_amount / remained_partitions;
-        if (remained_partitions == 1) {
+        EdgeId expected_chunk_size = remained_amount / remained_partitions; // 期望剩余socket的分割指标尽可能一致
+        if (remained_partitions == 1) { // 最后一个socket的右边界为节点的右边界
           local_partition_offset[s_i + 1] = partition_offset[partition_id + 1];
         } else {
           EdgeId got_edges = 0;
           for (VertexId v_i = local_partition_offset[s_i]; v_i < partition_offset[partition_id + 1]; v_i++) {
             got_edges += out_degree[v_i] + alpha;
-            if (got_edges > expected_chunk_size) {
+            if (got_edges > expected_chunk_size) { // 找到连续的顶点使得最接近但不超过分割指标
               local_partition_offset[s_i + 1] = v_i;
               break;
             }
           }
           local_partition_offset[s_i + 1] =
-              (local_partition_offset[s_i + 1]) / PAGESIZE * PAGESIZE; // aligned with pages
+              (local_partition_offset[s_i + 1]) / PAGESIZE * PAGESIZE; // aligned with pages, 边界4K对齐
         }
         EdgeId sub_part_out_edges = 0;
-        for (VertexId v_i = local_partition_offset[s_i]; v_i < local_partition_offset[s_i + 1]; v_i++) {
+        for (VertexId v_i = local_partition_offset[s_i]; v_i < local_partition_offset[s_i + 1]; v_i++) { // 计算剩余的分割指标
           remained_amount -= out_degree[v_i] + alpha;
-          sub_part_out_edges += out_degree[v_i];
+          sub_part_out_edges += out_degree[v_i]; // 输出debug信息用
         }
 #ifdef PRINT_DEBUG_MESSAGES
-        printf("|V'_%d_%d| = %u |E^dense_%d_%d| = %lu\n", partition_id, s_i, local_partition_offset[s_i+1] - local_partition_offset[s_i], partition_id, s_i, sub_part_out_edges);
+        printf("|V'_%d_%d| = %u |E^dense_%d_%d| = %lu\n",
+               partition_id,
+               s_i,
+               local_partition_offset[s_i + 1] - local_partition_offset[s_i],
+               partition_id,
+               s_i,
+               sub_part_out_edges);
 #endif
       }
     }
 
+    // numa-aware, 属于当前节点的顶点的out_degree存至对应socket的内存中
     VertexId *filtered_out_degree = alloc_vertex_array<VertexId>();
     for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1]; v_i++) {
       filtered_out_degree[v_i] = out_degree[v_i];
     }
     numa_free(out_degree, sizeof(VertexId) * vertices);
     out_degree = filtered_out_degree;
+
     in_degree = alloc_vertex_array<VertexId>();
-    for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1]; v_i++) {
+    for (VertexId v_i = partition_offset[partition_id]; v_i < partition_offset[partition_id + 1]; v_i++) { // 入度数组初始化
       in_degree[v_i] = 0;
     }
 
-    int *buffered_edges = new int[partitions];
+    int *buffered_edges = new int[partitions]; // 放入发送buffer的边的数量
     std::vector<char> *send_buffer = new std::vector<char>[partitions];
     for (int i = 0; i < partitions; i++) {
       send_buffer[i].resize(edge_unit_size * CHUNKSIZE);
@@ -1004,13 +1046,13 @@ class Graph {
       std::thread recv_thread_dst([&]() {
         int finished_count = 0;
         MPI_Status recv_status;
-        while (finished_count < partitions) {
+        while (finished_count < partitions) { // 接收所有节点的消息
           MPI_Probe(MPI_ANY_SOURCE, ShuffleGraph, MPI_COMM_WORLD, &recv_status);
           int i = recv_status.MPI_SOURCE;
           assert(recv_status.MPI_TAG == ShuffleGraph && i >= 0 && i < partitions);
           int recv_bytes;
           MPI_Get_count(&recv_status, MPI_CHAR, &recv_bytes);
-          if (recv_bytes == 1) {
+          if (recv_bytes == 1) { // 收到结束信号
             finished_count += 1;
             char c;
             MPI_Recv(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1029,16 +1071,16 @@ class Graph {
           for (EdgeId e_i = 0; e_i < recv_edges; e_i++) {
             VertexId src = recv_buffer[e_i].src;
             VertexId dst = recv_buffer[e_i].dst;
-            assert(dst >= partition_offset[partition_id] && dst < partition_offset[partition_id + 1]);
+            assert(dst >= partition_offset[partition_id] && dst < partition_offset[partition_id + 1]); // dst属于当前节点
             int dst_part = get_local_partition_id(dst);
-            if (!outgoing_adj_bitmap[dst_part]->get_bit(src)) {
+            if (!outgoing_adj_bitmap[dst_part]->get_bit(src)) { // src是一个在dst_part分区上含有出边的顶点
               outgoing_adj_bitmap[dst_part]->set_bit(src);
               outgoing_adj_index[dst_part][src] = 0;
             }
-            __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1);
-            __sync_fetch_and_add(&in_degree[dst], 1);
+            __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1); // src的出边数量加一
+            __sync_fetch_and_add(&in_degree[dst], 1); // dst的入度加一
           }
-          recv_outgoing_edges += recv_edges;
+          recv_outgoing_edges += recv_edges; // 累加收到的边的数量
         }
       });
       for (int i = 0; i < partitions; i++) {
@@ -1046,7 +1088,7 @@ class Graph {
       }
       assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
       read_bytes = 0;
-      while (read_bytes < bytes_to_read) {
+      while (read_bytes < bytes_to_read) { // 从节点对应的文件偏移处开始读数据
         long curr_read_bytes;
         if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
           curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
@@ -1059,22 +1101,22 @@ class Graph {
         for (EdgeId e_i = 0; e_i < curr_read_edges; e_i++) {
           VertexId dst = read_edge_buffer[e_i].dst;
           int i = get_partition_id(dst);
-          memcpy(send_buffer[i].data() + edge_unit_size * buffered_edges[i],
-                 &read_edge_buffer[e_i],
+          memcpy(send_buffer[i].data() + edge_unit_size * buffered_edges[i], // 存至vector内存的偏移位置
+                 &read_edge_buffer[e_i], // 读的边的数据
                  edge_unit_size);
           buffered_edges[i] += 1;
-          if (buffered_edges[i] == CHUNKSIZE) {
+          if (buffered_edges[i] == CHUNKSIZE) { // 每读一个CHUNKSIZE的数量的边就发送
             MPI_Send(send_buffer[i].data(),
                      edge_unit_size * buffered_edges[i],
                      MPI_CHAR,
-                     i,
+                     i, // 发送到dst所属的节点
                      ShuffleGraph,
                      MPI_COMM_WORLD);
             buffered_edges[i] = 0;
           }
         }
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送剩余的边数据
         if (buffered_edges[i] == 0) continue;
         MPI_Send(send_buffer[i].data(),
                  edge_unit_size * buffered_edges[i],
@@ -1084,7 +1126,7 @@ class Graph {
                  MPI_COMM_WORLD);
         buffered_edges[i] = 0;
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送结束信号
         char c = 0;
         MPI_Send(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD);
       }
@@ -1093,14 +1135,15 @@ class Graph {
       printf("machine(%d) got %lu sparse mode edges\n", partition_id, recv_outgoing_edges);
 #endif
     }
+
     compressed_outgoing_adj_vertices = new VertexId[sockets];
     compressed_outgoing_adj_index = new CompressedAdjIndexUnit *[sockets];
     for (int s_i = 0; s_i < sockets; s_i++) {
       outgoing_edges[s_i] = 0;
       compressed_outgoing_adj_vertices[s_i] = 0;
       for (VertexId v_i = 0; v_i < vertices; v_i++) {
-        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) {
-          outgoing_edges[s_i] += outgoing_adj_index[s_i][v_i];
+        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) { // v_i在s_i上有出边
+          outgoing_edges[s_i] += outgoing_adj_index[s_i][v_i]; // 此时outgoing_adj_index存的是v_i的出边数量
           compressed_outgoing_adj_vertices[s_i] += 1;
         }
       }
@@ -1110,21 +1153,21 @@ class Graph {
       EdgeId last_e_i = 0;
       compressed_outgoing_adj_vertices[s_i] = 0;
       for (VertexId v_i = 0; v_i < vertices; v_i++) {
-        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) {
-          outgoing_adj_index[s_i][v_i] = last_e_i + outgoing_adj_index[s_i][v_i];
+        if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) { // v_i在s_i上有出边，计算出边数组中每个点的范围的偏移量
+          outgoing_adj_index[s_i][v_i] = last_e_i + outgoing_adj_index[s_i][v_i]; // 求s_i上有出边的顶点的出边数量的前缀和
           last_e_i = outgoing_adj_index[s_i][v_i];
-          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].vertex = v_i;
-          compressed_outgoing_adj_vertices[s_i] += 1;
-          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].index = last_e_i;
+          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].vertex = v_i; // v_i是有出边的顶点
+          compressed_outgoing_adj_vertices[s_i] += 1; // 有出边的顶点数量加一
+          compressed_outgoing_adj_index[s_i][compressed_outgoing_adj_vertices[s_i]].index = last_e_i; // v_i的出边的结尾偏移量
         }
       }
       for (VertexId p_v_i = 0; p_v_i < compressed_outgoing_adj_vertices[s_i]; p_v_i++) {
-        VertexId v_i = compressed_outgoing_adj_index[s_i][p_v_i].vertex;
-        outgoing_adj_index[s_i][v_i] = compressed_outgoing_adj_index[s_i][p_v_i].index;
-        outgoing_adj_index[s_i][v_i + 1] = compressed_outgoing_adj_index[s_i][p_v_i + 1].index;
+        VertexId v_i = compressed_outgoing_adj_index[s_i][p_v_i].vertex; // 每个在s_i上有出边的顶点v_i
+        outgoing_adj_index[s_i][v_i] = compressed_outgoing_adj_index[s_i][p_v_i].index; // 出边的起始偏移量
+        outgoing_adj_index[s_i][v_i + 1] = compressed_outgoing_adj_index[s_i][p_v_i + 1].index; // 出边的结尾偏移量
       }
 #ifdef PRINT_DEBUG_MESSAGES
-      printf("part(%d) E_%d has %lu sparse mode edges\n", partition_id, s_i, outgoing_edges[s_i]);
+      printf("part(%d) E_%d has %lu sparse mode edges\n", partition_id, s_i, outgoing_edges[s_i]); // 稀疏推送，有出边的顶点
 #endif
       outgoing_adj_list[s_i] = (AdjUnit<EdgeData> *) numa_alloc_onnode(unit_size * outgoing_edges[s_i], s_i);
     }
@@ -1132,13 +1175,13 @@ class Graph {
       std::thread recv_thread_dst([&]() {
         int finished_count = 0;
         MPI_Status recv_status;
-        while (finished_count < partitions) {
+        while (finished_count < partitions) { // 接收所有节点的消息
           MPI_Probe(MPI_ANY_SOURCE, ShuffleGraph, MPI_COMM_WORLD, &recv_status);
           int i = recv_status.MPI_SOURCE;
           assert(recv_status.MPI_TAG == ShuffleGraph && i >= 0 && i < partitions);
           int recv_bytes;
           MPI_Get_count(&recv_status, MPI_CHAR, &recv_bytes);
-          if (recv_bytes == 1) {
+          if (recv_bytes == 1) { // 收到结束信号
             finished_count += 1;
             char c;
             MPI_Recv(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1159,10 +1202,10 @@ class Graph {
             VertexId dst = recv_buffer[e_i].dst;
             assert(dst >= partition_offset[partition_id] && dst < partition_offset[partition_id + 1]);
             int dst_part = get_local_partition_id(dst);
-            EdgeId pos = __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1);
-            outgoing_adj_list[dst_part][pos].neighbour = dst;
+            EdgeId pos = __sync_fetch_and_add(&outgoing_adj_index[dst_part][src], 1); // 占用一个位置
+            outgoing_adj_list[dst_part][pos].neighbour = dst; // 记录邻居为dst
             if (!std::is_same<EdgeData, Empty>::value) {
-              outgoing_adj_list[dst_part][pos].edge_data = recv_buffer[e_i].edge_data;
+              outgoing_adj_list[dst_part][pos].edge_data = recv_buffer[e_i].edge_data; // 记录边权
             }
           }
         }
@@ -1172,7 +1215,7 @@ class Graph {
       }
       assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
       read_bytes = 0;
-      while (read_bytes < bytes_to_read) {
+      while (read_bytes < bytes_to_read) { // 从节点对应的文件偏移位置开始读数据
         long curr_read_bytes;
         if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
           curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
@@ -1193,14 +1236,14 @@ class Graph {
             MPI_Send(send_buffer[i].data(),
                      edge_unit_size * buffered_edges[i],
                      MPI_CHAR,
-                     i,
+                     i, // 发给dst所属的节点
                      ShuffleGraph,
                      MPI_COMM_WORLD);
             buffered_edges[i] = 0;
           }
         }
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送剩余数据
         if (buffered_edges[i] == 0) continue;
         MPI_Send(send_buffer[i].data(),
                  edge_unit_size * buffered_edges[i],
@@ -1210,13 +1253,13 @@ class Graph {
                  MPI_COMM_WORLD);
         buffered_edges[i] = 0;
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送结束信号
         char c = 0;
         MPI_Send(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD);
       }
       recv_thread_dst.join();
     }
-    for (int s_i = 0; s_i < sockets; s_i++) {
+    for (int s_i = 0; s_i < sockets; s_i++) { // 恢复出边的范围的偏移量
       for (VertexId p_v_i = 0; p_v_i < compressed_outgoing_adj_vertices[s_i]; p_v_i++) {
         VertexId v_i = compressed_outgoing_adj_index[s_i][p_v_i].vertex;
         outgoing_adj_index[s_i][v_i] = compressed_outgoing_adj_index[s_i][p_v_i].index;
@@ -1239,13 +1282,13 @@ class Graph {
       std::thread recv_thread_src([&]() {
         int finished_count = 0;
         MPI_Status recv_status;
-        while (finished_count < partitions) {
+        while (finished_count < partitions) { // 接收所有节点的消息
           MPI_Probe(MPI_ANY_SOURCE, ShuffleGraph, MPI_COMM_WORLD, &recv_status);
           int i = recv_status.MPI_SOURCE;
           assert(recv_status.MPI_TAG == ShuffleGraph && i >= 0 && i < partitions);
           int recv_bytes;
           MPI_Get_count(&recv_status, MPI_CHAR, &recv_bytes);
-          if (recv_bytes == 1) {
+          if (recv_bytes == 1) { // 收到结束信号
             finished_count += 1;
             char c;
             MPI_Recv(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1264,15 +1307,15 @@ class Graph {
           for (EdgeId e_i = 0; e_i < recv_edges; e_i++) {
             VertexId src = recv_buffer[e_i].src;
             VertexId dst = recv_buffer[e_i].dst;
-            assert(src >= partition_offset[partition_id] && src < partition_offset[partition_id + 1]);
+            assert(src >= partition_offset[partition_id] && src < partition_offset[partition_id + 1]); // src属于当前节点
             int src_part = get_local_partition_id(src);
-            if (!incoming_adj_bitmap[src_part]->get_bit(dst)) {
+            if (!incoming_adj_bitmap[src_part]->get_bit(dst)) { // dst是一个在src_part分区上含有入边的顶点
               incoming_adj_bitmap[src_part]->set_bit(dst);
               incoming_adj_index[src_part][dst] = 0;
             }
-            __sync_fetch_and_add(&incoming_adj_index[src_part][dst], 1);
+            __sync_fetch_and_add(&incoming_adj_index[src_part][dst], 1); // dst的入度加一
           }
-          recv_incoming_edges += recv_edges;
+          recv_incoming_edges += recv_edges; // 累加收到的边的数量
         }
       });
       for (int i = 0; i < partitions; i++) {
@@ -1280,7 +1323,7 @@ class Graph {
       }
       assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
       read_bytes = 0;
-      while (read_bytes < bytes_to_read) {
+      while (read_bytes < bytes_to_read) { // 从节点对应的文件偏移处开始读数据
         long curr_read_bytes;
         if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
           curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
@@ -1301,14 +1344,14 @@ class Graph {
             MPI_Send(send_buffer[i].data(),
                      edge_unit_size * buffered_edges[i],
                      MPI_CHAR,
-                     i,
+                     i, // 发送到src所属的节点
                      ShuffleGraph,
                      MPI_COMM_WORLD);
             buffered_edges[i] = 0;
           }
         }
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送剩余的边数据
         if (buffered_edges[i] == 0) continue;
         MPI_Send(send_buffer[i].data(),
                  edge_unit_size * buffered_edges[i],
@@ -1318,7 +1361,7 @@ class Graph {
                  MPI_COMM_WORLD);
         buffered_edges[i] = 0;
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送结束信号
         char c = 0;
         MPI_Send(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD);
       }
@@ -1327,14 +1370,15 @@ class Graph {
       printf("machine(%d) got %lu dense mode edges\n", partition_id, recv_incoming_edges);
 #endif
     }
+
     compressed_incoming_adj_vertices = new VertexId[sockets];
     compressed_incoming_adj_index = new CompressedAdjIndexUnit *[sockets];
     for (int s_i = 0; s_i < sockets; s_i++) {
       incoming_edges[s_i] = 0;
       compressed_incoming_adj_vertices[s_i] = 0;
       for (VertexId v_i = 0; v_i < vertices; v_i++) {
-        if (incoming_adj_bitmap[s_i]->get_bit(v_i)) {
-          incoming_edges[s_i] += incoming_adj_index[s_i][v_i];
+        if (incoming_adj_bitmap[s_i]->get_bit(v_i)) { // v_i在s_i上有入边
+          incoming_edges[s_i] += incoming_adj_index[s_i][v_i]; // 此时incoming_adj_index存的是v_i的入边数量
           compressed_incoming_adj_vertices[s_i] += 1;
         }
       }
@@ -1344,21 +1388,21 @@ class Graph {
       EdgeId last_e_i = 0;
       compressed_incoming_adj_vertices[s_i] = 0;
       for (VertexId v_i = 0; v_i < vertices; v_i++) {
-        if (incoming_adj_bitmap[s_i]->get_bit(v_i)) {
-          incoming_adj_index[s_i][v_i] = last_e_i + incoming_adj_index[s_i][v_i];
+        if (incoming_adj_bitmap[s_i]->get_bit(v_i)) { // v_i在s_i上有入边，计算入边数组中每个点的范围的偏移量
+          incoming_adj_index[s_i][v_i] = last_e_i + incoming_adj_index[s_i][v_i]; // 求s_i上有入边的顶点的入边数量的前缀和
           last_e_i = incoming_adj_index[s_i][v_i];
-          compressed_incoming_adj_index[s_i][compressed_incoming_adj_vertices[s_i]].vertex = v_i;
-          compressed_incoming_adj_vertices[s_i] += 1;
-          compressed_incoming_adj_index[s_i][compressed_incoming_adj_vertices[s_i]].index = last_e_i;
+          compressed_incoming_adj_index[s_i][compressed_incoming_adj_vertices[s_i]].vertex = v_i; // v_i是有入边的顶点
+          compressed_incoming_adj_vertices[s_i] += 1; // 有入边的顶点数量加一
+          compressed_incoming_adj_index[s_i][compressed_incoming_adj_vertices[s_i]].index = last_e_i; // v_i的入边的结尾偏移量
         }
       }
       for (VertexId p_v_i = 0; p_v_i < compressed_incoming_adj_vertices[s_i]; p_v_i++) {
-        VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex;
-        incoming_adj_index[s_i][v_i] = compressed_incoming_adj_index[s_i][p_v_i].index;
-        incoming_adj_index[s_i][v_i + 1] = compressed_incoming_adj_index[s_i][p_v_i + 1].index;
+        VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex; // 每个在s_i上有入边的顶点v_i
+        incoming_adj_index[s_i][v_i] = compressed_incoming_adj_index[s_i][p_v_i].index; // 入边的起始偏移量
+        incoming_adj_index[s_i][v_i + 1] = compressed_incoming_adj_index[s_i][p_v_i + 1].index; // 入边的结尾偏移量
       }
 #ifdef PRINT_DEBUG_MESSAGES
-      printf("part(%d) E_%d has %lu dense mode edges\n", partition_id, s_i, incoming_edges[s_i]);
+      printf("part(%d) E_%d has %lu dense mode edges\n", partition_id, s_i, incoming_edges[s_i]); // 稠密拉取，有入边的顶点
 #endif
       incoming_adj_list[s_i] = (AdjUnit<EdgeData> *) numa_alloc_onnode(unit_size * incoming_edges[s_i], s_i);
     }
@@ -1366,13 +1410,13 @@ class Graph {
       std::thread recv_thread_src([&]() {
         int finished_count = 0;
         MPI_Status recv_status;
-        while (finished_count < partitions) {
+        while (finished_count < partitions) { // 接收所有节点的消息
           MPI_Probe(MPI_ANY_SOURCE, ShuffleGraph, MPI_COMM_WORLD, &recv_status);
           int i = recv_status.MPI_SOURCE;
           assert(recv_status.MPI_TAG == ShuffleGraph && i >= 0 && i < partitions);
           int recv_bytes;
           MPI_Get_count(&recv_status, MPI_CHAR, &recv_bytes);
-          if (recv_bytes == 1) {
+          if (recv_bytes == 1) { // 收到结束信号
             finished_count += 1;
             char c;
             MPI_Recv(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1393,10 +1437,10 @@ class Graph {
             VertexId dst = recv_buffer[e_i].dst;
             assert(src >= partition_offset[partition_id] && src < partition_offset[partition_id + 1]);
             int src_part = get_local_partition_id(src);
-            EdgeId pos = __sync_fetch_and_add(&incoming_adj_index[src_part][dst], 1);
-            incoming_adj_list[src_part][pos].neighbour = src;
+            EdgeId pos = __sync_fetch_and_add(&incoming_adj_index[src_part][dst], 1); // 占用一个位置
+            incoming_adj_list[src_part][pos].neighbour = src; // 记录邻居为src
             if (!std::is_same<EdgeData, Empty>::value) {
-              incoming_adj_list[src_part][pos].edge_data = recv_buffer[e_i].edge_data;
+              incoming_adj_list[src_part][pos].edge_data = recv_buffer[e_i].edge_data; // 记录边权
             }
           }
         }
@@ -1406,7 +1450,7 @@ class Graph {
       }
       assert(lseek(fin, read_offset, SEEK_SET) == read_offset);
       read_bytes = 0;
-      while (read_bytes < bytes_to_read) {
+      while (read_bytes < bytes_to_read) { // 从节点对应的文件偏移位置开始读数据
         long curr_read_bytes;
         if (bytes_to_read - read_bytes > edge_unit_size * CHUNKSIZE) {
           curr_read_bytes = read(fin, read_edge_buffer, edge_unit_size * CHUNKSIZE);
@@ -1427,14 +1471,14 @@ class Graph {
             MPI_Send(send_buffer[i].data(),
                      edge_unit_size * buffered_edges[i],
                      MPI_CHAR,
-                     i,
+                     i, // 发给src所属的节点
                      ShuffleGraph,
                      MPI_COMM_WORLD);
             buffered_edges[i] = 0;
           }
         }
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送剩余数据
         if (buffered_edges[i] == 0) continue;
         MPI_Send(send_buffer[i].data(),
                  edge_unit_size * buffered_edges[i],
@@ -1444,13 +1488,13 @@ class Graph {
                  MPI_COMM_WORLD);
         buffered_edges[i] = 0;
       }
-      for (int i = 0; i < partitions; i++) {
+      for (int i = 0; i < partitions; i++) { // 发送结束信号
         char c = 0;
         MPI_Send(&c, 1, MPI_CHAR, i, ShuffleGraph, MPI_COMM_WORLD);
       }
       recv_thread_src.join();
     }
-    for (int s_i = 0; s_i < sockets; s_i++) {
+    for (int s_i = 0; s_i < sockets; s_i++) { // 恢复入边的范围的偏移量
       for (VertexId p_v_i = 0; p_v_i < compressed_incoming_adj_vertices[s_i]; p_v_i++) {
         VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex;
         incoming_adj_index[s_i][v_i] = compressed_incoming_adj_index[s_i][p_v_i].index;
@@ -1473,16 +1517,16 @@ class Graph {
     prep_time += MPI_Wtime();
 
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
+    if (partition_id == 0) {
       printf("preprocessing cost: %.2lf (s)\n", prep_time);
     }
 #endif
   }
 
-  void tune_chunks() {
+  void tune_chunks() { // 计算dense模式下每个线程处理的范围
     tuned_chunks_dense = new ThreadState *[partitions];
     int current_send_part_id = partition_id;
-    for (int step = 0; step < partitions; step++) {
+    for (int step = 0; step < partitions; step++) { // 轮询节点
       current_send_part_id = (current_send_part_id + 1) % partitions;
       int i = current_send_part_id;
       tuned_chunks_dense[i] = new ThreadState[threads];
@@ -1494,7 +1538,7 @@ class Graph {
         tuned_chunks_dense[i][t_i].status = WORKING;
         int s_i = get_socket_id(t_i);
         int s_j = get_socket_offset(t_i);
-        if (s_j == 0) {
+        if (s_j == 0) { // 当是socket中的第一个线程时，计算分割指标
           VertexId p_v_i = 0;
           while (p_v_i < compressed_incoming_adj_vertices[s_i]) {
             VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex;
@@ -1503,7 +1547,7 @@ class Graph {
             }
             p_v_i++;
           }
-          last_p_v_i = p_v_i;
+          last_p_v_i = p_v_i; // s_i上第一个属于节点i的有入边的顶点的位置
           while (p_v_i < compressed_incoming_adj_vertices[s_i]) {
             VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex;
             if (v_i >= partition_offset[i + 1]) {
@@ -1511,9 +1555,9 @@ class Graph {
             }
             p_v_i++;
           }
-          end_p_v_i = p_v_i;
+          end_p_v_i = p_v_i; // s_i上最后一个属于节点i的有入边的顶点的下一个位置
           remained_edges = 0;
-          for (VertexId p_v_i = last_p_v_i; p_v_i < end_p_v_i; p_v_i++) {
+          for (VertexId p_v_i = last_p_v_i; p_v_i < end_p_v_i; p_v_i++) { // 计算remained_edges为分割指标
             remained_edges += compressed_incoming_adj_index[s_i][p_v_i + 1].index
                 - compressed_incoming_adj_index[s_i][p_v_i].index;
             remained_edges += alpha;
@@ -1521,28 +1565,27 @@ class Graph {
         }
         tuned_chunks_dense[i][t_i].curr = last_p_v_i;
         tuned_chunks_dense[i][t_i].end = last_p_v_i;
-        remained_partitions = threads_per_socket - s_j;
-        EdgeId expected_chunk_size = remained_edges / remained_partitions;
+        remained_partitions = threads_per_socket - s_j; // 线程t_i所属的socket中的剩余线程
+        EdgeId expected_chunk_size = remained_edges / remained_partitions; // 期望剩余边的分割指标尽可能相等
         if (remained_partitions == 1) {
-          tuned_chunks_dense[i][t_i].end = end_p_v_i;
+          tuned_chunks_dense[i][t_i].end = end_p_v_i; // 最后一个线程的处理范围的右边界为顶点的范围的右边界
         } else {
           EdgeId got_edges = 0;
           for (VertexId p_v_i = last_p_v_i; p_v_i < end_p_v_i; p_v_i++) {
             got_edges += compressed_incoming_adj_index[s_i][p_v_i + 1].index
                 - compressed_incoming_adj_index[s_i][p_v_i].index + alpha;
-            if (got_edges >= expected_chunk_size) {
-              tuned_chunks_dense[i][t_i].end = p_v_i;
-              last_p_v_i = tuned_chunks_dense[i][t_i].end;
+            if (got_edges >= expected_chunk_size) { // 找到连续的边使得最接近但不超过分割指标
+              tuned_chunks_dense[i][t_i].end = p_v_i; // 该线程的右边界
+              last_p_v_i = tuned_chunks_dense[i][t_i].end; // 下一个线程的左边界
               break;
             }
           }
           got_edges = 0;
-          for (VertexId p_v_i = tuned_chunks_dense[i][t_i].curr; p_v_i < tuned_chunks_dense[i][t_i].end;
-               p_v_i++) {
+          for (VertexId p_v_i = tuned_chunks_dense[i][t_i].curr; p_v_i < tuned_chunks_dense[i][t_i].end; p_v_i++) {
             got_edges += compressed_incoming_adj_index[s_i][p_v_i + 1].index
                 - compressed_incoming_adj_index[s_i][p_v_i].index + alpha;
           }
-          remained_edges -= got_edges;
+          remained_edges -= got_edges; // 剩余的分割指标
         }
       }
     }
@@ -1556,7 +1599,7 @@ class Graph {
 
     R reducer = 0;
     size_t basic_chunk = 64;
-    for (int t_i = 0; t_i < threads; t_i++) {
+    for (int t_i = 0; t_i < threads; t_i++) { // 划分线程工作范围
       int s_i = get_socket_id(t_i);
       int s_j = get_socket_offset(t_i);
       VertexId partition_size = local_partition_offset[s_i + 1] - local_partition_offset[s_i];
@@ -1564,7 +1607,7 @@ class Graph {
           local_partition_offset[s_i] + partition_size / threads_per_socket / basic_chunk * basic_chunk * s_j;
       thread_state[t_i]->end = local_partition_offset[s_i]
           + partition_size / threads_per_socket / basic_chunk * basic_chunk * (s_j + 1);
-      if (s_j == threads_per_socket - 1) {
+      if (s_j == threads_per_socket - 1) { // socket中的最后一个线程
         thread_state[t_i]->end = local_partition_offset[s_i + 1];
       }
       thread_state[t_i]->status = WORKING;
@@ -1574,11 +1617,11 @@ class Graph {
       R local_reducer = 0;
       int thread_id = omp_get_thread_num();
       while (true) {
-        VertexId v_i = __sync_fetch_and_add(&thread_state[thread_id]->curr, basic_chunk);
+        VertexId v_i = __sync_fetch_and_add(&thread_state[thread_id]->curr, basic_chunk); // 当前需要处理的起始顶点
         if (v_i >= thread_state[thread_id]->end) break;
         unsigned long word = active->data[WORD_OFFSET(v_i)];
-        while (word != 0) {
-          if (word & 1) {
+        while (word != 0) { // 64位对应basic_chunk大小
+          if (word & 1) { // 是活跃顶点调用process
             local_reducer += process(v_i);
           }
           v_i++;
@@ -1586,7 +1629,7 @@ class Graph {
         }
       }
       thread_state[thread_id]->status = STEALING;
-      for (int t_offset = 1; t_offset < threads; t_offset++) {
+      for (int t_offset = 1; t_offset < threads; t_offset++) { // 轮询窃取
         int t_i = (thread_id + t_offset) % threads;
         while (thread_state[t_i]->status != STEALING) {
           VertexId v_i = __sync_fetch_and_add(&thread_state[t_i]->curr, basic_chunk);
@@ -1608,13 +1651,16 @@ class Graph {
     MPI_Allreduce(&reducer, &global_reducer, 1, dt, MPI_SUM, MPI_COMM_WORLD);
     stream_time += MPI_Wtime();
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
+    if (partition_id == 0) {
       printf("process_vertices took %lf (s)\n", stream_time);
     }
 #endif
     return global_reducer;
   }
 
+  /// 从线程的发送buffer移动到socket的发送buffer
+  /// \tparam M
+  /// \param t_i
   template<typename M>
   void flush_local_send_buffer(int t_i) {
     int s_i = get_socket_id(t_i);
@@ -1641,8 +1687,8 @@ class Graph {
   // process edges
   template<typename R, typename M>
   R process_edges(std::function<void(VertexId)> sparse_signal,
-                  std::function<R(VertexId, M, VertexAdjList < EdgeData > )> sparse_slot,
-                  std::function<void(VertexId, VertexAdjList < EdgeData > )> dense_signal,
+                  std::function<R(VertexId, M, VertexAdjList<EdgeData>)> sparse_slot,
+                  std::function<void(VertexId, VertexAdjList<EdgeData>)> dense_signal,
                   std::function<R(VertexId, M)> dense_slot,
                   Bitmap *active,
                   Bitmap *dense_selective = nullptr) {
@@ -1661,42 +1707,42 @@ class Graph {
         active
     );
     bool sparse = (active_edges < edges / 20);
-    if (sparse) {
+    if (sparse) { // 稀疏推送，主副本->镜像副本
       for (int i = 0; i < partitions; i++) {
         for (int s_i = 0; s_i < sockets; s_i++) {
           recv_buffer[i][s_i]->resize(
-              sizeof(MsgUnit<M>) * (partition_offset[i + 1] - partition_offset[i]) * sockets);
-          send_buffer[i][s_i]->resize(sizeof(MsgUnit<M>) * owned_vertices * sockets);
+              sizeof(MsgUnit<M>) * (partition_offset[i + 1] - partition_offset[i]) * sockets); // 接收：节点s_i的主副本数量*sockets
+          send_buffer[i][s_i]->resize(sizeof(MsgUnit<M>) * owned_vertices * sockets); // 发送：本地主副本数量*sockets
           send_buffer[i][s_i]->count = 0;
           recv_buffer[i][s_i]->count = 0;
         }
       }
-    } else {
+    } else { // 稠密拉取，镜像副本->主副本
       for (int i = 0; i < partitions; i++) {
         for (int s_i = 0; s_i < sockets; s_i++) {
-          recv_buffer[i][s_i]->resize(sizeof(MsgUnit<M>) * owned_vertices * sockets);
+          recv_buffer[i][s_i]->resize(sizeof(MsgUnit<M>) * owned_vertices * sockets); // 接收：本地主副本数量*sockets
           send_buffer[i][s_i]->resize(
-              sizeof(MsgUnit<M>) * (partition_offset[i + 1] - partition_offset[i]) * sockets);
+              sizeof(MsgUnit<M>) * (partition_offset[i + 1] - partition_offset[i]) * sockets); // 发送：节点s_i的主副本数量*sockets
           send_buffer[i][s_i]->count = 0;
           recv_buffer[i][s_i]->count = 0;
         }
       }
     }
     size_t basic_chunk = 64;
-    if (sparse) {
+    if (sparse) { // 稀疏推送
 #ifdef PRINT_DEBUG_MESSAGES
-      if (partition_id==0) {
+      if (partition_id == 0) {
         printf("sparse mode\n");
       }
 #endif
       int *recv_queue = new int[partitions];
       int recv_queue_size = 0;
-      std::mutex recv_queue_mutex;
+      std::mutex recv_queue_mutex; // 队列锁
 
       current_send_part_id = partition_id;
 #pragma omp parallel for
       for (VertexId begin_v_i = partition_offset[partition_id]; begin_v_i < partition_offset[partition_id + 1];
-           begin_v_i += basic_chunk) {
+           begin_v_i += basic_chunk) { // 活跃顶点主副本调用sparse_signal进行广播
         VertexId v_i = begin_v_i;
         unsigned long word = active->data[WORD_OFFSET(v_i)];
         while (word != 0) {
@@ -1708,14 +1754,15 @@ class Graph {
         }
       }
 #pragma omp parallel for
-      for (int t_i = 0; t_i < threads; t_i++) {
+      for (int t_i = 0; t_i < threads; t_i++) { // 移入socket的发送buffer
         flush_local_send_buffer<M>(t_i);
       }
+
       recv_queue[recv_queue_size] = partition_id;
       recv_queue_mutex.lock();
       recv_queue_size += 1;
       recv_queue_mutex.unlock();
-      std::thread send_thread([&]() {
+      std::thread send_thread([&]() { // 逆序轮询发送
         for (int step = 1; step < partitions; step++) {
           int i = (partition_id - step + partitions) % partitions;
           for (int s_i = 0; s_i < sockets; s_i++) {
@@ -1728,7 +1775,7 @@ class Graph {
           }
         }
       });
-      std::thread recv_thread([&]() {
+      std::thread recv_thread([&]() { // 顺序轮询接收
         for (int step = 1; step < partitions; step++) {
           int i = (partition_id + step) % partitions;
           for (int s_i = 0; s_i < sockets; s_i++) {
@@ -1751,7 +1798,7 @@ class Graph {
         }
       });
       for (int step = 0; step < partitions; step++) {
-        while (true) {
+        while (true) { // 循环等待直到收到消息
           recv_queue_mutex.lock();
           bool condition = (recv_queue_size <= step);
           recv_queue_mutex.unlock();
@@ -1760,21 +1807,20 @@ class Graph {
         }
         int i = recv_queue[step];
         MessageBuffer **used_buffer;
-        if (i == partition_id) {
+        if (i == partition_id) { // 节点自身
           used_buffer = send_buffer[i];
         } else {
           used_buffer = recv_buffer[i];
         }
-        for (int s_i = 0; s_i < sockets; s_i++) {
+        for (int s_i = 0; s_i < sockets; s_i++) { // 对于buffer中的每个socket
           MsgUnit<M> *buffer = (MsgUnit<M> *) used_buffer[s_i]->data;
           size_t buffer_size = used_buffer[s_i]->count;
-          for (int t_i = 0; t_i < threads; t_i++) {
+          for (int t_i = 0; t_i < threads; t_i++) { // 划分线程工作范围
             // int s_i = get_socket_id(t_i);
             int s_j = get_socket_offset(t_i);
             VertexId partition_size = buffer_size;
             thread_state[t_i]->curr = partition_size / threads_per_socket / basic_chunk * basic_chunk * s_j;
-            thread_state[t_i]->end =
-                partition_size / threads_per_socket / basic_chunk * basic_chunk * (s_j + 1);
+            thread_state[t_i]->end = partition_size / threads_per_socket / basic_chunk * basic_chunk * (s_j + 1);
             if (s_j == threads_per_socket - 1) {
               thread_state[t_i]->end = buffer_size;
             }
@@ -1786,7 +1832,7 @@ class Graph {
             int thread_id = omp_get_thread_num();
             int s_i = get_socket_id(thread_id);
             while (true) {
-              VertexId b_i = __sync_fetch_and_add(&thread_state[thread_id]->curr, basic_chunk);
+              VertexId b_i = __sync_fetch_and_add(&thread_state[thread_id]->curr, basic_chunk); // buffer中的偏移位置
               if (b_i >= thread_state[thread_id]->end) break;
               VertexId begin_b_i = b_i;
               VertexId end_b_i = b_i + basic_chunk;
@@ -1796,19 +1842,17 @@ class Graph {
               for (b_i = begin_b_i; b_i < end_b_i; b_i++) {
                 VertexId v_i = buffer[b_i].vertex;
                 M msg_data = buffer[b_i].msg_data;
-                if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) {
+                if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) { // s_i中v_i有出边，调用sparse_slot更新邻居
                   local_reducer += sparse_slot(v_i,
                                                msg_data,
-                                               VertexAdjList<EdgeData>(outgoing_adj_list[s_i]
-                                                                           + outgoing_adj_index[s_i][v_i],
-                                                                       outgoing_adj_list[s_i]
-                                                                           + outgoing_adj_index[s_i][
-                                                                               v_i + 1]));
+                                               VertexAdjList<EdgeData>(
+                                                   outgoing_adj_list[s_i] + outgoing_adj_index[s_i][v_i],
+                                                   outgoing_adj_list[s_i] + outgoing_adj_index[s_i][v_i + 1]));
                 }
               }
             }
             thread_state[thread_id]->status = STEALING;
-            for (int t_offset = 1; t_offset < threads; t_offset++) {
+            for (int t_offset = 1; t_offset < threads; t_offset++) { // 轮询窃取
               int t_i = (thread_id + t_offset) % threads;
               if (thread_state[t_i]->status == STEALING) continue;
               while (true) {
@@ -1826,11 +1870,9 @@ class Graph {
                   if (outgoing_adj_bitmap[s_i]->get_bit(v_i)) {
                     local_reducer += sparse_slot(v_i,
                                                  msg_data,
-                                                 VertexAdjList<EdgeData>(outgoing_adj_list[s_i]
-                                                                             + outgoing_adj_index[s_i][v_i],
-                                                                         outgoing_adj_list[s_i]
-                                                                             + outgoing_adj_index[s_i][
-                                                                                 v_i + 1]));
+                                                 VertexAdjList<EdgeData>(
+                                                     outgoing_adj_list[s_i] + outgoing_adj_index[s_i][v_i],
+                                                     outgoing_adj_list[s_i] + outgoing_adj_index[s_i][v_i + 1]));
                   }
                 }
               }
@@ -1842,9 +1884,9 @@ class Graph {
       send_thread.join();
       recv_thread.join();
       delete[] recv_queue;
-    } else {
+    } else { // 稠密拉取
       // dense selective bitmap
-      if (dense_selective != nullptr && partitions > 1) {
+      if (dense_selective != nullptr && partitions > 1) { // 传入了dense模式的选定顶点，同步至所有节点
         double sync_time = 0;
         sync_time -= get_time();
         std::thread send_thread([&]() {
@@ -1875,13 +1917,13 @@ class Graph {
         MPI_Barrier(MPI_COMM_WORLD);
         sync_time += get_time();
 #ifdef PRINT_DEBUG_MESSAGES
-        if (partition_id==0) {
+        if (partition_id == 0) {
           printf("sync_time = %lf\n", sync_time);
         }
 #endif
       }
 #ifdef PRINT_DEBUG_MESSAGES
-      if (partition_id==0) {
+      if (partition_id == 0) {
         printf("dense mode\n");
       }
 #endif
@@ -1894,10 +1936,10 @@ class Graph {
 
       std::thread send_thread([&]() {
         for (int step = 0; step < partitions; step++) {
-          if (step == partitions - 1) {
+          if (step == partitions - 1) { // 不用发送给自身
             break;
           }
-          while (true) {
+          while (true) { // 循环等待直到填充消息
             send_queue_mutex.lock();
             bool condition = (send_queue_size <= step);
             send_queue_mutex.unlock();
@@ -1918,8 +1960,8 @@ class Graph {
       std::thread recv_thread([&]() {
         std::vector<std::thread> threads;
         for (int step = 1; step < partitions; step++) {
-          int i = (partition_id - step + partitions) % partitions;
-          threads.emplace_back([&](int i) {
+          int i = (partition_id - step + partitions) % partitions; // 逆序轮询
+          threads.emplace_back([&](int i) { // 对于每个节点i开一个线程
             for (int s_i = 0; s_i < sockets; s_i++) {
               MPI_Status recv_status;
               MPI_Probe(i, PassMessage, MPI_COMM_WORLD, &recv_status);
@@ -1935,7 +1977,7 @@ class Graph {
             }
           }, i);
         }
-        for (int step = 1; step < partitions; step++) {
+        for (int step = 1; step < partitions; step++) { // 逆序轮询，直到收到所有节点的消息
           int i = (partition_id - step + partitions) % partitions;
           threads[step - 1].join();
           recv_queue[recv_queue_size] = i;
@@ -1949,10 +1991,10 @@ class Graph {
         recv_queue_mutex.unlock();
       });
       current_send_part_id = partition_id;
-      for (int step = 0; step < partitions; step++) {
+      for (int step = 0; step < partitions; step++) { // 顺序轮询发送节点
         current_send_part_id = (current_send_part_id + 1) % partitions;
         int i = current_send_part_id;
-        for (int t_i = 0; t_i < threads; t_i++) {
+        for (int t_i = 0; t_i < threads; t_i++) { // 拷贝稠密模式发送给节点i时当前节点的线程的顶点范围
           *thread_state[t_i] = tuned_chunks_dense[i][t_i];
         }
 #pragma omp parallel
@@ -1967,17 +2009,16 @@ class Graph {
             if (end_p_v_i > final_p_v_i) {
               end_p_v_i = final_p_v_i;
             }
-            for (VertexId p_v_i = begin_p_v_i; p_v_i < end_p_v_i; p_v_i++) {
+            for (VertexId p_v_i = begin_p_v_i; p_v_i < end_p_v_i; p_v_i++) { // 对于需要发送消息的顶点调用dense_signal遍历邻居
               VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex;
               dense_signal(v_i,
                            VertexAdjList<EdgeData>(
                                incoming_adj_list[s_i] + compressed_incoming_adj_index[s_i][p_v_i].index,
-                               incoming_adj_list[s_i]
-                                   + compressed_incoming_adj_index[s_i][p_v_i + 1].index));
+                               incoming_adj_list[s_i] + compressed_incoming_adj_index[s_i][p_v_i + 1].index));
             }
           }
           thread_state[thread_id]->status = STEALING;
-          for (int t_offset = 1; t_offset < threads; t_offset++) {
+          for (int t_offset = 1; t_offset < threads; t_offset++) { // 轮询窃取
             int t_i = (thread_id + t_offset) % threads;
             int s_i = get_socket_id(t_i);
             while (thread_state[t_i]->status != STEALING) {
@@ -1990,28 +2031,27 @@ class Graph {
               for (VertexId p_v_i = begin_p_v_i; p_v_i < end_p_v_i; p_v_i++) {
                 VertexId v_i = compressed_incoming_adj_index[s_i][p_v_i].vertex;
                 dense_signal(v_i,
-                             VertexAdjList<EdgeData>(incoming_adj_list[s_i]
-                                                         + compressed_incoming_adj_index[s_i][p_v_i].index,
-                                                     incoming_adj_list[s_i]
-                                                         + compressed_incoming_adj_index[s_i][p_v_i
-                                                             + 1].index));
+                             VertexAdjList<EdgeData>(
+                                 incoming_adj_list[s_i] + compressed_incoming_adj_index[s_i][p_v_i].index,
+                                 incoming_adj_list[s_i] + compressed_incoming_adj_index[s_i][p_v_i + 1].index));
               }
             }
           }
         }
 #pragma omp parallel for
-        for (int t_i = 0; t_i < threads; t_i++) {
+        for (int t_i = 0; t_i < threads; t_i++) { // 移入发送buffer
           flush_local_send_buffer<M>(t_i);
         }
-        if (i != partition_id) {
+        if (i != partition_id) { // 如果不是当前节点，放入发送队列
           send_queue[send_queue_size] = i;
           send_queue_mutex.lock();
           send_queue_size += 1;
           send_queue_mutex.unlock();
         }
       }
+
       for (int step = 0; step < partitions; step++) {
-        while (true) {
+        while (true) { // 循环等待收到消息
           recv_queue_mutex.lock();
           bool condition = (recv_queue_size <= step);
           recv_queue_mutex.unlock();
@@ -2020,7 +2060,7 @@ class Graph {
         }
         int i = recv_queue[step];
         MessageBuffer **used_buffer;
-        if (i == partition_id) {
+        if (i == partition_id) { // 是节点自身
           used_buffer = send_buffer[i];
         } else {
           used_buffer = recv_buffer[i];
@@ -2044,14 +2084,14 @@ class Graph {
           int s_i = get_socket_id(thread_id);
           MsgUnit<M> *buffer = (MsgUnit<M> *) used_buffer[s_i]->data;
           while (true) {
-            VertexId b_i = __sync_fetch_and_add(&thread_state[thread_id]->curr, basic_chunk);
+            VertexId b_i = __sync_fetch_and_add(&thread_state[thread_id]->curr, basic_chunk); // buffer中的偏移位置
             if (b_i >= thread_state[thread_id]->end) break;
             VertexId begin_b_i = b_i;
             VertexId end_b_i = b_i + basic_chunk;
             if (end_b_i > thread_state[thread_id]->end) {
               end_b_i = thread_state[thread_id]->end;
             }
-            for (b_i = begin_b_i; b_i < end_b_i; b_i++) {
+            for (b_i = begin_b_i; b_i < end_b_i; b_i++) { // 对顶点自身调用dense_slot更新
               VertexId v_i = buffer[b_i].vertex;
               M msg_data = buffer[b_i].msg_data;
               local_reducer += dense_slot(v_i, msg_data);
@@ -2072,7 +2112,7 @@ class Graph {
     MPI_Allreduce(&reducer, &global_reducer, 1, dt, MPI_SUM, MPI_COMM_WORLD);
     stream_time += MPI_Wtime();
 #ifdef PRINT_DEBUG_MESSAGES
-    if (partition_id==0) {
+    if (partition_id == 0) {
       printf("process_edges took %lf (s)\n", stream_time);
     }
 #endif
@@ -2083,3 +2123,4 @@ class Graph {
 
 #endif
 
+#pragma clang diagnostic pop

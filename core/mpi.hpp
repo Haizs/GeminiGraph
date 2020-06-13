@@ -47,12 +47,12 @@ MPI_Datatype get_mpi_data_type() {
 }
 
 class MPI_Instance {
-  int partition_id;
-  int partitions;
+  int partition_id; // the rank of the calling process in the communicator
+  int partitions; // the size of the group associated with a communicator
  public:
   MPI_Instance(int *argc, char ***argv) {
     int provided;
-    MPI_Init_thread(argc, argv, MPI_THREAD_MULTIPLE, &provided);
+    MPI_Init_thread(argc, argv, MPI_THREAD_MULTIPLE, &provided); // Multiple threads may call MPI, with no restrictions.
     MPI_Comm_rank(MPI_COMM_WORLD, &partition_id);
     MPI_Comm_size(MPI_COMM_WORLD, &partitions);
 #ifdef PRINT_DEBUG_MESSAGES

@@ -21,6 +21,12 @@ Copyright (c) 2015-2016 Xiaowei Zhu, Tsinghua University
 #include <stdlib.h>
 #include <assert.h>
 
+/// 如果*ptr等于old_val则更新为new_val
+/// \tparam T
+/// \param ptr
+/// \param old_val
+/// \param new_val
+/// \return 更新成功
 template<class T>
 inline bool cas(T *ptr, T old_val, T new_val) {
   if (sizeof(T) == 8) {
@@ -32,6 +38,11 @@ inline bool cas(T *ptr, T old_val, T new_val) {
   }
 }
 
+/// *ptr写入和val的较小值
+/// \tparam T
+/// \param ptr
+/// \param val
+/// \return 写入成功
 template<class T>
 inline bool write_min(T *ptr, T val) {
   volatile T curr_val;
@@ -42,6 +53,10 @@ inline bool write_min(T *ptr, T val) {
   return done;
 }
 
+/// *ptr写入与val的和
+/// \tparam T
+/// \param ptr
+/// \param val
 template<class T>
 inline void write_add(T *ptr, T val) {
   volatile T new_val, old_val;
